@@ -99,6 +99,18 @@ Cloudflare Workers require a slightly specific order of operations when you are 
    After this deployment, your MCP server will be fully functional and live at a URL like:
    `https://support-mcp.YOUR-SUBDOMAIN.workers.dev/mcp`
 
+## Learner Docs: Firebase Auth wrapped in OAuth
+
+This MCP Server uses a fully stateless OAuth 2.1 implementation to wrap **Firebase Authentication (Email/Password & Google)**. Because Claude Desktop requires a standard OAuth flow for interactive login, we act as our own OAuth Identity Provider!
+
+### How the OAuth Flow Works
+1. **Initiation**: When Claude Desktop connects, it looks at `/.well-known/oauth-authorization-server` and discovers our `/authorize` endpoint. It opens your browser to this URL.
+2. **Firebase UI**: Our `/authorize` endpoint serves a static HTML page (`src/login.html`) that loads the **Firebase Auth UI**.
+3. **Authentication**: The user logs in with Email/Password or Google. Firebase issues an **ID Token**.
+4. **Stateless Code Generation**: The `login.html` page sends the Firebase ID token to our internal `/api/generate-code` endpoint. The Cloudflare Worker uses the `jose` Web Crypto library to fetch Google's public keys and **verifies the Firebase token**. If valid, it signs a short-lived stateless JWT acting as the OAuth `authorization_code`.
+5. **Token Exchange**: The browser redirects back to Claude Desktop with this code. Claude Desktop immediately calls our `/token` endpoint to securely exchange the code for an `access_token` (which is another signed JWT valid for 30 days).
+6. **Authenticated Requests**: With every subsequent request to `/mcp`, Claude Desktop attaches the token as an `Authorization: Bearer <access_token>` header. Our Hono middleware verifies this token, extracts the user's `email`, and securely injects it into the MCP tools!
+
 ## Updating Existing Deployments
 Whenever you make changes to the code (like adding new tools or fixing bugs), simply run:
 ```bash

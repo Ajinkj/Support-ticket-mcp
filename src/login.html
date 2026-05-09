@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Login to Support Agent</title>
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/ui/6.1.0/firebase-ui-auth.js"></script>
+  <link type="text/css" rel="stylesheet" href="https://www.gstatic.com/firebasejs/ui/6.1.0/firebase-ui-auth.css" />
+  <style>
+    body { font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #f4f4f9; }
+    .container { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; max-width: 400px; width: 100%; }
+    h1 { color: #333; }
+    p { color: #666; margin-bottom: 2rem; }
+    #loader { display: none; margin-top: 20px; color: #666; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Support Agent</h1>
+    <p>Please log in to authenticate Claude Desktop.</p>
+    <div id="firebaseui-auth-container"></div>
+    <div id="loader">Authenticating with server, please wait...</div>
+  </div>
+
+  <script>
+    // These config values will be injected by the Hono router
+    const firebaseConfig = {
+      apiKey: "FIREBASE_API_KEY_PLACEHOLDER",
+      authDomain: "FIREBASE_AUTH_DOMAIN_PLACEHOLDER",
+      projectId: "FIREBASE_PROJECT_ID_PLACEHOLDER"
+    };
+
+    firebase.initializeApp(firebaseConfig);
+
+    const uiConfig = {
+      callbacks: {
+        signInSuccessWithAuthResult: function(authResult, redirectUrl) {
+          document.getElementById('firebaseui-auth-container').style.display = 'none';
+          document.getElementById('loader').style.display = 'block';
+          
+          authResult.user.getIdToken().then(function(idToken) {
+            // Get OAuth params from URL
+            const urlParams = new URLSearchParams(window.location.search);
+            
+            // Send token to our Cloudflare Worker to generate the OAuth code
+            fetch('/api/generate-code', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                idToken: idToken,
+                redirect_uri: urlParams.get('redirect_uri'),
+                state: urlParams.get('state'),
+                code_challenge: urlParams.get('code_challenge')
+              })
+            })
+            .then(res => res.json())
+            .then(data => {
+              if (data.redirectUrl) {
+                window.location.href = data.redirectUrl;
+              } else {
+                alert('Error generating OAuth code: ' + (data.error || 'Unknown error'));
+              }
+            })
+            .catch(err => {
+              alert('Network error during authentication: ' + err.message);
+            });
+          });
+          return false; // Prevent default redirect
+        }
+      },
+      signInFlow: 'popup',
+      signInOptions: [
+        firebase.auth.GoogleAuthProvider.PROVIDER_ID,
+        firebase.auth.EmailAuthProvider.PROVIDER_ID
+      ]
+    };
+
+    const ui = new firebaseui.auth.AuthUI(firebase.auth());
+    ui.start('#firebaseui-auth-container', uiConfig);
+  </script>
+</body>
+</html>

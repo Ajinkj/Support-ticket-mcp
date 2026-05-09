@@ -2,14 +2,17 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { firebaseApi, initFirebase } from "./firebase";
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { verifyFirebaseToken, signStatelessToken, verifyStatelessToken, verifyCodeChallenge } from "./auth";
+// @ts-ignore
+import loginHtml from "./login.html" with { type: "text" };
 
-// Transport will be created per request
-
-const server = new McpServer({
-  name: "support-mcp-server",
-  version: "1.0.0",
-});
+function createMcpServer(userEmail: string = "admin@local") {
+  const server = new McpServer({
+    name: "support-mcp-server",
+    version: "1.0.0",
+  });
 
 // Prompt: Provide Support Agent Context
 server.prompt(
@@ -127,18 +130,17 @@ server.tool(
     customerDescription: z.string().optional().describe("Description of the issue from the customer"),
     businessImpact: z.enum(['Low', 'Medium', 'High', 'Critical']).describe("Business impact level"),
     category: z.string().describe("Category of the ticket"),
-    customerEmail: z.string().describe("Email address of the customer creating the ticket"),
     ticketNumber: z.string().describe("The ticket ID or ticket Number provided by the user. If they do not provide one, use the ticket subject/title as the ticket ID."),
     supportingLinks: z.array(z.string()).default([]).describe("Any supporting links or references")
   },
-  async ({ title, customerDescription, businessImpact, category, customerEmail, ticketNumber, supportingLinks }) => {
+  async ({ title, customerDescription, businessImpact, category, ticketNumber, supportingLinks }) => {
     try {
       const ticket = await firebaseApi.createTicket({
         title,
         customerDescription,
         businessImpact,
         category,
-        customerEmail,
+        customerEmail: userEmail, // Extracted automatically from the auth token!
         ticketNumber,
         supportingLinks
       });
@@ -209,29 +211,151 @@ server.tool(
   }
 );
 
-const app = new Hono<{ Bindings: { ADMIN_KEY?: string } }>();
+  return server;
+}
 
-// Simple Auth Middleware
-app.use('/mcp/*', async (c, next) => {
-  const ADMIN_KEY = c.env.ADMIN_KEY;
+const app = new Hono<{ 
+  Bindings: { 
+    ADMIN_KEY?: string; 
+    FIREBASE_PROJECT_ID?: string; 
+    FIREBASE_API_KEY?: string; 
+    FIREBASE_AUTH_DOMAIN?: string 
+  };
+  Variables: {
+    userEmail: string;
+  }
+}>();
+
+// Enable CORS for Claude.ai web client
+app.use('*', cors({
+  origin: '*',
+  allowHeaders: ['Content-Type', 'Authorization', 'Mcp-Session-Id'],
+  exposeHeaders: ['Mcp-Session-Id'],
+  allowMethods: ['GET', 'POST', 'OPTIONS']
+}));
+
+// ----------------------------------------------------
+// OAuth 2.1 Endpoints for Claude Desktop Integration
+// ----------------------------------------------------
+
+app.get('/.well-known/oauth-authorization-server', (c) => {
+  const baseUrl = new URL(c.req.url).origin;
+  return c.json({
+    issuer: baseUrl,
+    authorization_endpoint: `${baseUrl}/authorize`,
+    token_endpoint: `${baseUrl}/token`,
+    response_types_supported: ["code"],
+    code_challenge_methods_supported: ["S256"]
+  });
+});
+
+app.get('/authorize', (c) => {
+  // Serve the HTML page, injecting the Firebase config from env
+  const html = loginHtml
+    .replace('FIREBASE_API_KEY_PLACEHOLDER', c.env.FIREBASE_API_KEY || '')
+    .replace('FIREBASE_AUTH_DOMAIN_PLACEHOLDER', c.env.FIREBASE_AUTH_DOMAIN || '')
+    .replace('FIREBASE_PROJECT_ID_PLACEHOLDER', c.env.FIREBASE_PROJECT_ID || '');
+    
+  return c.html(html);
+});
+
+app.post('/api/generate-code', async (c) => {
+  try {
+    const { idToken, redirect_uri, state, code_challenge } = await c.req.json();
+    
+    // Verify Firebase Token
+    const payload = await verifyFirebaseToken(idToken, c.env.FIREBASE_PROJECT_ID!);
+    
+    // Generate stateless auth code containing user email and PKCE challenge
+    const adminKey = c.env.ADMIN_KEY || 'default-secret';
+    const authCode = await signStatelessToken({
+      email: payload.email,
+      sub: payload.sub,
+      code_challenge
+    }, adminKey, '10m'); // Short-lived code
+    
+    // Redirect back to Claude Desktop with the code
+    const redirectUrl = `${redirect_uri}?code=${authCode}&state=${state}`;
+    return c.json({ redirectUrl });
+  } catch (error) {
+    return c.json({ error: (error as Error).message }, 400);
+  }
+});
+
+app.post('/token', async (c) => {
+  const body = await c.req.parseBody();
+  const code = body['code'] as string;
+  const code_verifier = body['code_verifier'] as string;
   
-  if (ADMIN_KEY) {
-    const authHeader = c.req.header('Authorization');
-    const urlKey = new URL(c.req.url).searchParams.get('key');
+  if (!code || !code_verifier) return c.json({ error: 'Missing code or verifier' }, 400);
+  
+  const adminKey = c.env.ADMIN_KEY || 'default-secret';
+  
+  try {
+    const payload = await verifyStatelessToken(code, adminKey);
     
-    const isAuthorized = authHeader === `Bearer ${ADMIN_KEY}` || urlKey === ADMIN_KEY;
+    // Verify PKCE Challenge
+    const isValid = await verifyCodeChallenge(code_verifier, payload.code_challenge as string);
+    if (!isValid) return c.json({ error: 'Invalid PKCE verifier' }, 400);
     
-    if (!isAuthorized) {
-      return c.json({ error: "Unauthorized. Please provide a valid key." }, 401);
+    // Issue final Access Token
+    const accessToken = await signStatelessToken({
+      email: payload.email,
+      sub: payload.sub
+    }, adminKey, '30d');
+    
+    return c.json({
+      access_token: accessToken,
+      token_type: "Bearer",
+      expires_in: 30 * 24 * 60 * 60
+    });
+  } catch (error) {
+    return c.json({ error: 'Invalid or expired code' }, 400);
+  }
+});
+
+// ----------------------------------------------------
+// MCP Server Endpoint
+// ----------------------------------------------------
+
+// Advanced Auth Middleware (API Key or Stateless JWT)
+app.use('/mcp/*', async (c, next) => {
+  const ADMIN_KEY = c.env.ADMIN_KEY || 'default-secret';
+  
+  const authHeader = c.req.header('Authorization');
+  const urlKey = new URL(c.req.url).searchParams.get('key');
+  
+  // 1. Direct API Key check (for local testing without OAuth)
+  if (urlKey === ADMIN_KEY || authHeader === `Bearer ${ADMIN_KEY}`) {
+    c.set('userEmail', 'admin@local');
+    await next();
+    return;
+  }
+  
+  // 2. OAuth Stateless Token verification
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.replace('Bearer ', '');
+    try {
+      const payload = await verifyStatelessToken(token, ADMIN_KEY);
+      c.set('userEmail', payload.email as string);
+      await next();
+      return;
+    } catch (e) {
+      c.header('WWW-Authenticate', `Bearer resource_metadata="${new URL(c.req.url).origin}/.well-known/oauth-authorization-server"`);
+      return c.json({ error: "Invalid OAuth token." }, 401);
     }
   }
   
-  await next();
+  c.header('WWW-Authenticate', `Bearer resource_metadata="${new URL(c.req.url).origin}/.well-known/oauth-authorization-server"`);
+  return c.json({ error: "Unauthorized. Please authenticate." }, 401);
 });
 
 // MCP endpoint
 app.all('/mcp/*', async (c) => {
   initFirebase(c.env as any);
+  
+  const userEmail = c.get('userEmail') as string;
+  const server = createMcpServer(userEmail);
   
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
